@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>降水预报偏差校正 · 两阶段分位映射</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body data-theme="light">
+  <div class="viz-root">
+    <header class="topbar">
+      <div class="brand">
+        <h1>降水预报偏差校正</h1>
+        <p class="subtitle">发生与否 × 量级 两阶段分位映射 · 连续年份隔离 · 标定版本化</p>
+      </div>
+      <div class="topbar-actions">
+        <span id="dataBadge" class="badge badge-muted">未载入数据</span>
+        <span id="revBadge" class="badge badge-muted" hidden></span>
+        <button id="themeToggle" class="btn btn-ghost" type="button">切换深色</button>
+      </div>
+    </header>
+
+    <!-- ===================== 控制区 ===================== -->
+    <section class="panel controls">
+      <div class="control-group">
+        <h2>1 · 数据</h2>
+        <div class="control-row">
+          <button id="loadSynthetic" class="btn btn-primary" type="button">载入合成数据（已知偏差+已知趋势）</button>
+          <label class="btn btn-ghost file-btn">导入历史 CSV
+            <input id="historyFile" type="file" accept=".csv" hidden />
+          </label>
+          <label class="btn btn-ghost file-btn">导入待校正 CSV
+            <input id="futureFile" type="file" accept=".csv" hidden />
+          </label>
+          <button id="importBtn" class="btn" type="button" disabled>上传导入</button>
+        </div>
+        <p class="hint">历史需含 date,obs,hindcast；待校正需含 date,forecast。文件仅在本地解析。</p>
+        <div id="manifest" class="manifest" hidden></div>
+      </div>
+
+      <div class="control-group">
+        <h2>2 · 配置与方法</h2>
+        <div class="control-grid">
+          <label>季节模式
+            <select id="seasonMode">
+              <option value="seasonal" selected>分季（DJF/MAM/JJA/SON）</option>
+              <option value="annual">全年不分季</option>
+            </select>
+          </label>
+          <label>查看季节
+            <select id="seasonSelect">
+              <option>DJF</option><option>MAM</option>
+              <option selected>JJA</option><option>SON</option>
+            </select>
+          </label>
+          <label>发生方法
+            <select id="occMethod">
+              <option value="auto" selected>自动（CV 选择）</option>
+              <option value="plain">plain 对齐历史频率</option>
+              <option value="trend">trend 保持频率信号</option>
+            </select>
+          </label>
+          <label>量级方法
+            <select id="amountMethod">
+              <option value="auto" selected>自动（CV 选择）</option>
+              <option value="qm">QM 普通分位映射</option>
+              <option value="qdm">QDM 保持变化信号</option>
+            </select>
+          </label>
+          <label>发生实现
+            <select id="occMode">
+              <option value="deterministic" selected>确定性阈值（无随机）</option>
+              <option value="stochastic">随机化分位（持久化 RNG）</option>
+            </select>
+          </label>
+          <label>尾部处理
+            <select id="tailMode">
+              <option value="extrapolate" selected>GPD 外推（保留尾部信号）</option>
+              <option value="clip">截断到观测最大值</option>
+            </select>
+          </label>
+          <label>尾部阈值分位
+            <input id="tailQuantile" type="number" min="0.5" max="0.99" step="0.01" value="0.85" />
+          </label>
+          <label>随机种子（可选）
+            <input id="seedInput" type="number" placeholder="留空自动生成并保存" />
+          </label>
+        </div>
+        <div class="control-grid four">
+          <label>训练年数<input id="trainYears" type="number" min="1" value="6" /></label>
+          <label>选择年数<input id="valYears" type="number" min="1" value="3" /></label>
+          <label>评估年数<input id="testYears" type="number" min="1" value="3" /></label>
+          <label>滚动步长<input id="stride" type="number" min="1" value="1" /></label>
+        </div>
+        <div class="control-row">
+          <button id="runCv" class="btn btn-primary" type="button">运行连续年份交叉验证</button>
+          <button id="runCalibrate" class="btn btn-primary" type="button">标定并校正未来</button>
+          <button id="runCompare" class="btn" type="button">对比 QM vs QDM</button>
+          <button id="reviseBtn" class="btn btn-warn" type="button">模拟观测修订（×1.1）</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="errorBox" class="error-box" hidden></div>
+
+    <!-- ===================== 湿日频率 ===================== -->
+    <section class="panel">
+      <h2>湿日比例（零值质量）</h2>
+      <div id="wetFreqCards" class="stat-row"></div>
+      <div id="wetFreqChart" class="chart"></div>
+      <p class="hint">plain 把频率压回历史观测；trend 保留未来频率的相对变化。真值仅用于核对，不参与拟合。</p>
+    </section>
+
+    <!-- ===================== 分位变化 ===================== -->
+    <section class="panel">
+      <h2>分位变化（量级映射）</h2>
+      <div id="quantileChart" class="chart tall"></div>
+      <div id="quantileTable"></div>
+    </section>
+
+    <!-- ===================== 极端尾部 ===================== -->
+    <section class="panel">
+      <h2>极端尾部与超训练范围</h2>
+      <div id="tailCards" class="stat-row"></div>
+      <div id="tailChart" class="chart"></div>
+    </section>
+
+    <!-- ===================== 时间序列 ===================== -->
+    <section class="panel">
+      <h2>未来块时间序列（原值 vs 校正值）</h2>
+      <div id="seriesChart" class="chart tall"></div>
+    </section>
+
+    <!-- ===================== 交叉验证 ===================== -->
+    <section class="panel">
+      <h2>连续年份隔离：训练 / 选择 / 评估</h2>
+      <div id="cvPlan" class="cv-plan"></div>
+      <div id="cvDetail"></div>
+    </section>
+
+    <!-- ===================== 单条映射来由 ===================== -->
+    <section class="panel">
+      <h2>单条预报的映射来由</h2>
+      <div class="control-row">
+        <label>标定
+          <select id="explainCal"></select>
+        </label>
+        <label>未来行号
+          <input id="explainRow" type="number" min="0" value="0" />
+        </label>
+        <button id="explainBtn" class="btn" type="button">解析映射</button>
+      </div>
+      <div id="explainOutput" class="explain"></div>
+    </section>
+
+    <!-- ===================== 标定版本 / 修订绑定 / 导出 ===================== -->
+    <section class="panel">
+      <h2>标定版本、观测修订绑定与导出</h2>
+      <div id="calibrationList" class="cal-list"></div>
+      <div class="control-row">
+        <button id="exportBtn" class="btn btn-primary" type="button" disabled>导出所选标定的原值/校正值 CSV</button>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span>纯统计后处理演示 · 不连接任何气象业务平台 · 随机状态与标定均落盘可复现</span>
+    </footer>
+  </div>
+
+  <div id="tooltip" class="tooltip" hidden></div>
+  <script src="{{ url_for('static', filename='charts.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
